@@ -55,7 +55,7 @@ team_t team = {
 
 #define PACK(size, alloc) ((size) | (alloc))  // header/footer에 저장될 값 생성 (크기 + 할당 여부 비트)
 
-#define GET(p) (*(unsigned int *)(p))  // 주소 p의 값을 가져오기
+#define GET(p) (*(unsigned int *)(p))  // 주소 p의 값을 가져오기 (4바이트씩 읽기 위해 unsigned int*로 변환)
 #define PUT(p, val) (*(unsigned int *)(p) = (val))  // 주소 p의 값을 저장하기
 
 #define GET_SIZE(p) (GET(p) & ~0x7)  // header/footer에서 size 추출 (하위 3비트 제외하고 사이즈만)
@@ -70,18 +70,26 @@ team_t team = {
 //            char*는 1바이트 단위니까 정확한 주소 계산이 가능
 #define SUCC(bp) (*(void **)((char *)(bp) + WSIZE))  // 연결 리스트의 다음 주소 (bp에서 4바이트 떨어진 주소 계산)
 
-#define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))  // 힙의 다음 블록 포인터
+#define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))  // 힙의 다음 블록 포인터 (정확한 오프셋 계산을 위해 1바이트씩 증가하는 char*로 형변환)
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))  // 힙의 이전 블록 포인터
 
 static char *heap_listp;  // 힙의 시작 주소를 저장하는 포인터
 static char *free_listp;
 
+// forward declaration
 static void *coalesce(void *bp);
+static void *extend_heap(size_t words);
+static void insert_node(void *bp);
+static void remove_node(void *bp);
+static void *find_fit(size_t asize);
+static void place(void *bp, size_t asize);
 
 /*
  * insert_node - 가용 연결 리스트에 블록 삽입
  */
 static void insert_node(void *bp) {
+    if (bp == NULL) return;
+
     SUCC(bp) = free_listp;  // 새 노드가 기존 리스트의 맨 앞이 됨
     PRED(bp) = NULL;
 
@@ -106,21 +114,18 @@ static void *extend_heap(size_t words)
     if (size < MIN_BLOCK_SIZE)
         size = MIN_BLOCK_SIZE;
 
-    // mem_sbrk(size): size만큼 힙 공간을 추가 요
+    // mem_sbrk(size): size만큼 힙 공간을 추가 요구
     if ((long) (bp = mem_sbrk(size)) == -1)
         return NULL;
 
     // 새 블록의 헤더/푸터, 새로운 epilogue 블록 세팅
-    PUT (HDRP (bp), PACK(size, 0));  // 새 가용 블록의 헤더
-    PUT (FTRP (bp), PACK(size, 0));  // 새 가용 블록의 푸터
-    PUT (HDRP (NEXT_BLKP(bp)), PACK(0, 1)); // 새 에필로그 헤더
+    PUT (HDRP(bp), PACK(size, 0));  // 새 가용 블록의 헤더
+    PUT (FTRP(bp), PACK(size, 0));  // 새 가용 블록의 푸터
+    PUT (HDRP(NEXT_BLKP(bp)), PACK(0, 1)); // 새 에필로그 헤더
 
-    // 새 블록 초기화
+    // 연결 리스트 포인터 초기화
     PRED(bp) = NULL;
     SUCC(bp) = NULL;
-
-    // 가용 리스트에 추가
-    insert_node(bp);
 
     // 이전 블록과 병합 시도
     return coalesce(bp);
@@ -148,12 +153,17 @@ int mm_init(void)
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
         return -1;
 
-    // if (extend_heap(4) == NULL) return -1;  // 현호가 추가해준 코드
+    if (extend_heap(4) == NULL) return -1;  // 현호가 추가해준 코드
 
     return 0;
 }
 
+/*
+ * remove_node - 가용 연결 리스트에서 블록 제거
+ */
 static void remove_node(void *bp) {
+    if (bp == NULL) return;
+
     void *pred = PRED(bp);
     void *succ = SUCC(bp);
 
@@ -181,7 +191,7 @@ static void *coalesce(void *bp) {
     
     // Case 1: 이전, 다음 모두 할당 상태
     if (prev_alloc && next_alloc) {
-        insert_node(bp);
+        insert_node(bp);  // 현재 블록만 가용 리스트에 삽입
         return bp;
     }
 
@@ -204,12 +214,10 @@ static void *coalesce(void *bp) {
 
     // Case 4: 이전, 다음 모두 가용
     else {
-        void *prev = PREV_BLKP(bp);
-        void *next = NEXT_BLKP(bp);
         remove_node(PREV_BLKP(bp));
         remove_node(NEXT_BLKP(bp));
-        size += GET_SIZE(HDRP(prev)) +
-                GET_SIZE(FTRP(next));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) +
+                GET_SIZE(FTRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);                          // 병합된 블록의 시작 주소로 이동
@@ -220,7 +228,7 @@ static void *coalesce(void *bp) {
 }
 
 /*
- * find_fit - best-fit 방식으로 가용 리스트에서 적절한 블록을 찾음
+ * find_fit - first-fit 방식으로 가용 리스트에서 적절한 블록을 찾음
  */
 void *find_fit(size_t asize) {
     // implicit에서는 전체 heap 리스트를 순회했지만,
@@ -285,6 +293,11 @@ void place(void *bp, size_t asize) {
         // 그 위치에 (csize - asize, alloc=0) 헤더와 푸터를 기록
         PUT(HDRP(next_bp), PACK(csize - asize, 0));
         PUT(FTRP(next_bp), PACK(csize - asize, 0));
+
+        // 새로운 가용 블록의 연결 리스트 포인터 초기화
+        PRED(next_bp) = NULL;
+        SUCC(next_bp) = NULL;
+
         insert_node(next_bp);
     }
     // 그렇지 않으면 (남은 공간이 너무 작으면): 
@@ -301,6 +314,8 @@ void place(void *bp, size_t asize) {
  *     Always allocate a block whose size is a multiple of the alignment.
  */
 void *mm_malloc(size_t size) {
+    // mm_malloc 시작 부분에 추가
+    // printf("malloc called with size: %zu\n", size);
     size_t asize;  // 조정된 블록 크기
     size_t extendsize;  // 힙 확장 필요 시 크기
     char *bp;
@@ -324,7 +339,8 @@ void *mm_malloc(size_t size) {
 
     // 가용 블록이 없으면 힙 확장
     extendsize = MAX(asize, CHUNKSIZE);
-    if ((bp = extend_heap(extendsize/WSIZE)) == NULL) return NULL;
+    if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
+        return NULL;
     place(bp, asize);
     return bp;
 }
@@ -333,10 +349,16 @@ void *mm_malloc(size_t size) {
  * mm_free - 메모리 해제
  */
 void mm_free(void *ptr) {
+    if (ptr == NULL) return;
+
     size_t size = GET_SIZE(HDRP(ptr));      // 블록 크기
 
     PUT(HDRP(ptr), PACK(size, 0));          // 헤더: free 표시
     PUT(FTRP(ptr), PACK(size, 0));          // 푸터: free 표시
+    
+    PRED(ptr) = NULL;
+    SUCC(ptr) = NULL;
+
     coalesce(ptr); 
 }
 
@@ -352,6 +374,12 @@ void *mm_realloc(void *ptr, size_t size)
     // ptr이 NULL이면 malloc과 동일
     if (ptr == NULL) {
         return mm_malloc(size);
+    }
+
+    // size가 0이면 free와 동일
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
     }
     
     newptr = mm_malloc(size);  // 새 메모리 블록 할당
