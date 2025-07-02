@@ -50,6 +50,7 @@ team_t team = {
 #define DSIZE 8  // Double word size (bytes)
 #define MIN_BLOCK_SIZE 24
 #define CHUNKSIZE (1<<12)  // Extend heap by this amount (bytes)
+#define LISTLIMIT 20
 
 #define MAX(x, y) ((x) > (y)? (x) : (y))
 
@@ -74,7 +75,7 @@ team_t team = {
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))  // 힙의 이전 블록 포인터
 
 static char *heap_listp;  // 힙의 시작 주소를 저장하는 포인터
-static char *free_listp;
+static void *segregation_list[LISTLIMIT];
 
 // forward declaration
 static void *coalesce(void *bp);
@@ -88,16 +89,76 @@ static void place(void *bp, size_t asize);
  * insert_node - 가용 연결 리스트에 블록 삽입
  */
 static void insert_node(void *bp) {
-    if (bp == NULL) return;
+    int list_idx = 0;  // 사용할 리스트 인덱스
+    void *curr;  // 리스트를 탐색하며 현재 비교 중인 노드
+    void *prev = NULL;  // curr 직전 노드 (삽입 위치)
 
-    SUCC(bp) = free_listp;  // 새 노드가 기존 리스트의 맨 앞이 됨
-    PRED(bp) = NULL;
+    size_t size = GET_SIZE(HDRP(bp));  // 삽입할 블록의 크기
 
-    if (free_listp != NULL) {
-        PRED(free_listp) = bp;
+    // 블록 크기에 따라 적절한 리스트 인덱스를 선택
+    // 마지막 리스트 전까지, 블록 크기가 줄어들 여지가 있을 때까지 size를 절반으로 줄이며 적절한 리스트 인덱스 탐색
+    // size가 1 이하가 되면 그 이상 분류할 필요가 없음
+    while ((list_idx < LISTLIMIT - 1) && (size > 1)) {
+        // 2로 나누면서 크기 구간 좁혀가기
+        // 크기를 절반으로 줄여가면서, 얼마나 큰 크기인지를 판단 -> 작은 블록은 낮은 인덱스의 리스트로, 큰 블록은 높은 인덱스로 보냄
+
+        // size = 128;
+        // list_idx = 0;
+
+        // 128 > 1 → list_idx = 1, size = 64
+        // 64 > 1 → list_idx = 2, size = 32
+        // 32 > 1 → list_idx = 3, size = 16
+        // ...
+
+        // → 크기에 따라 list_idx가 점점 증가
+        size >>= 1;
+        list_idx++;
+    }
+    
+    curr = segregation_list[list_idx];
+    
+    // curr이 NULL이 아니고, 현재 curr의 크기가 bp보다 작으면 계속 이동
+    while ((curr != NULL) && (size >= GET_SIZE(HDRP(curr)))) {
+        prev = curr;        // 이전 노드 기억
+        curr = SUCC(curr);  // 다음 노드로 이동
     }
 
-    free_listp = bp;
+    // curr이 NULL이 아닐 때,
+    // 중간 또는 head에 삽입
+    if (curr != NULL) {
+        // prev이 NULL이 아닐 때
+        if (prev != NULL) {
+            // 중간 삽입
+            SUCC(bp) = curr;
+            PRED(bp) = prev;
+            PRED(curr) = bp;
+            SUCC(prev) = bp;
+        } else {
+            // head에 삽입
+            SUCC(bp) = curr;
+            PRED(bp) = NULL;
+            PRED(curr) = bp;
+            segregation_list[list_idx] = bp;
+        }
+    }
+    // curr이 NULL일 때,
+    // 리스트의 끝에 삽입
+    else {
+        if (prev != NULL) {
+            // 마지막 노드 뒤에 삽입
+            SUCC(bp) = NULL;
+            PRED(bp) = prev;
+            SUCC(prev) = bp;
+        }
+        // 아무것도 없어서 list에 내가 처음 넣을 때
+        else {
+            // 리스트에 아무 것도 없을 경우 (첫 삽입)
+            SUCC(bp) = NULL;
+            PRED(bp) = NULL;
+            segregation_list[list_idx] = bp;
+        }
+    }
+    return;
 }
 
 /*
@@ -136,6 +197,12 @@ static void *extend_heap(size_t words)
  */
 int mm_init(void)
 {
+    int list;
+
+    for (list = 0; list < LISTLIMIT; list++) {
+        segregation_list[list] = NULL;     // segregation_list를 NULL로 초기화
+    }
+    
     // 4개의 워드 공간을 요청: 패딩 + 프롤로그 헤더 + 프롤로그 푸터 + 에필로그
     if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
         return -1;
@@ -146,8 +213,6 @@ int mm_init(void)
     PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));     // 프롤로그 푸터
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));         // 에필로그 헤더
     heap_listp += (2 * WSIZE);                         // bp는 payload 시작점으로 옮김
-
-    free_listp = NULL;  // free list 초기화
 
     // 힙에 초기 가용 블록 생성 (힙에 최소한의 가용 공간이 있어야 malloc 요청을 처리할 수 있기 때문에)
     // CHUNKSIZE = 1 << 12 = 4096바이트
@@ -165,23 +230,37 @@ int mm_init(void)
  * remove_node - 가용 연결 리스트에서 블록 제거
  */
 static void remove_node(void *bp) {
-    if (bp == NULL) return;
+    int list_idx = 0;
+    size_t size = GET_SIZE(HDRP(bp));
 
-    void *pred = PRED(bp);
-    void *succ = SUCC(bp);
-
-    // pred가 NULL이 아니면, pred의 다음 주소를 succ로 설정
-    if (pred != NULL) {
-        SUCC(pred) = succ;
-    } else {
-        // pred가 NULL이면, 현재 블록이 free_list의 첫 번째 블록이므로
-        free_listp = succ;
+    // bp 크기에 따라 해당되는 리스트 인덱스를 구함
+    while ((list_idx < LISTLIMIT - 1) && (size > 1)) {
+        size >>= 1;
+        list_idx++;
     }
 
-    if (succ != NULL) {
-        // 다음 블록의 이전 주소를 pred로 설정
-        PRED(succ) = pred;
+    if (SUCC(bp) != NULL) {  // bp의 다음 노드가 존재할 경우
+        if (PRED(bp) != NULL) {  // 이전 노드가 존재한다면,
+            // 중간에 있는 노드를 제거하는 경우
+            PRED(SUCC(bp)) = PRED(bp);
+            SUCC(PRED(bp)) = SUCC(bp);
+        } else {
+            // head를 제거하는 경우
+            PRED(SUCC(bp)) = NULL;
+            segregation_list[list_idx] = SUCC(bp);
+        }
+    } else {  // SUCC 블록이 NULL일 경우,
+        // 마지막 노드 제거
+        if (PRED(bp) != NULL) {
+            // 마지막 노드지만 앞에 노드가 있는 경우
+            SUCC(PRED(bp)) = NULL;
+        } else {
+            // 리스트에 bp 하나만 있을 경우
+            segregation_list[list_idx] = NULL;
+        }
     }
+
+    return;
 }
 
 /*
@@ -241,36 +320,63 @@ void *find_fit(size_t asize) {
     /*
     first fit
     */
-    void *bp = free_listp;
+    void *bp;
 
-    while (bp != NULL) {
-        // 현재 블록 크기가 충분한지 확인
-        if (GET_SIZE(HDRP(bp)) >= asize)
-            return bp;
-        // 다음 가용 블록으로 넘어감
-        bp = SUCC(bp);
+    int list_idx = 0;
+    size_t searchSize = asize;
+
+    // LISTLIMIT까지 순회
+    while (list_idx < LISTLIMIT) {
+        // 현재 리스트에 적절한 크기의 블록이 있거나 마지막 리스트에 도달했을 경우
+        if ((list_idx == LISTLIMIT - 1) || ((searchSize <= 1) && (segregation_list[list_idx] != NULL))) {
+            bp = segregation_list[list_idx];
+
+            // 현재 리스트에서 첫 번째로 맞는 블록 찾기 (first-fit)
+            while ((bp != NULL) && (asize > GET_SIZE(HDRP(bp)))) {
+                bp = SUCC(bp);
+            }
+
+            // 조건에 맞는 블록을 찾았을 경우 즉시 반환
+            if (bp != NULL){
+                return bp;
+            }
+        }
+
+        // 다음 리스트로 넘어가기 위해 기준 크기 절반으로 줄이기
+        searchSize >>= 1;
+        list_idx++;
     }
 
-    // 끝까지 못 찾으면 NULL 반환
-    return NULL;
+    return NULL;  // 적절한 블록을 찾지 못함
 
     /*
     best fit
     */
-    // void *bp = free_listp;
+    // void *bp = NULL;
     // void *best_fit = NULL;
-    // size_t min_diff = (size_t)(-1);  // 최댓값
+    // size_t best_size = (size_t)-1;
 
-    // while (bp != NULL) {
-    //     size_t bsize = GET_SIZE(HDRP(bp));
-    //     // min_diff 갱신
-    //     if (bsize >= asize && (bsize - asize) < min_diff) {
-    //         best_fit = bp;
-    //         min_diff = bsize - asize;
-    //         if (min_diff == 0) break;  // perfect fit 확정!
+    // int list = 0;
+    // size_t searchSize = asize;
+
+    // while (list < LISTLIMIT) {
+    //     if (segregation_list[list] != NULL) {
+    //         bp = segregation_list[list];
+    //         while (bp != NULL) {
+    //             size_t bsize = GET_SIZE(HDRP(bp));
+    //             if (bsize >= asize && (bsize - asize) < best_size) {
+    //                 best_size = bsize - asize;
+    //                 best_fit = bp;
+    //                 if (best_size == 0) break; // perfect fit
+    //             }
+    //             bp = SUCC(bp);
+    //         }
+    //         if (best_fit != NULL) break;
     //     }
-    //     bp = SUCC(bp);
+    //     searchSize >>= 1;
+    //     list++;
     // }
+
     // return best_fit;
 }
 
@@ -362,9 +468,6 @@ void mm_free(void *ptr) {
 
     PUT(HDRP(ptr), PACK(size, 0));          // 헤더: free 표시
     PUT(FTRP(ptr), PACK(size, 0));          // 푸터: free 표시
-    
-    PRED(ptr) = NULL;
-    SUCC(ptr) = NULL;
 
     coalesce(ptr); 
 }
@@ -393,7 +496,7 @@ void *mm_realloc(void *ptr, size_t size)
     if (newptr == NULL)
       return NULL;
 
-    // 복사할 크기는 원래 블록의 사이즈
+    // 복사할 크기는 원래 블록의 사이즈 (헤더/푸터 크기 제외)
     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
 
     // 요청된 크기보다 원래 크기가 크면 잘라서 복사 (사용자가 요청한 만큼만 복사)
