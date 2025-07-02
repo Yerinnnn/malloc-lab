@@ -149,8 +149,11 @@ int mm_init(void)
 
     free_listp = NULL;  // free list 초기화
 
-    // 힙에 초기 가용 블록 생성
-    if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
+    // 힙에 초기 가용 블록 생성 (힙에 최소한의 가용 공간이 있어야 malloc 요청을 처리할 수 있기 때문에)
+    // CHUNKSIZE = 1 << 12 = 4096바이트
+    // WSIZE = 4바이트 (word size)
+    // CHUNKSIZE / WSIZE = 1024 word → 총 4096바이트만큼 힙을 늘림
+    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
 
     if (extend_heap(4) == NULL) return -1;  // 현호가 추가해준 코드
@@ -167,6 +170,7 @@ static void remove_node(void *bp) {
     void *pred = PRED(bp);
     void *succ = SUCC(bp);
 
+    // pred가 NULL이 아니면, pred의 다음 주소를 succ로 설정
     if (pred != NULL) {
         SUCC(pred) = succ;
     } else {
@@ -240,11 +244,14 @@ void *find_fit(size_t asize) {
     void *bp = free_listp;
 
     while (bp != NULL) {
+        // 현재 블록 크기가 충분한지 확인
         if (GET_SIZE(HDRP(bp)) >= asize)
             return bp;
+        // 다음 가용 블록으로 넘어감
         bp = SUCC(bp);
     }
 
+    // 끝까지 못 찾으면 NULL 반환
     return NULL;
 
     /*
@@ -371,12 +378,12 @@ void *mm_realloc(void *ptr, size_t size)
     void *newptr;
     size_t copySize;
 
-    // ptr이 NULL이면 malloc과 동일
+    // ptr이 NULL이면 재할당할 기존 메모리가 없다는 것이므로, malloc과 동일
     if (ptr == NULL) {
         return mm_malloc(size);
     }
 
-    // size가 0이면 free와 동일
+    // size가 0이면 free와 동일 (기존 메모리 해제하고, 아무 것도 안 받겠다는 의미)
     if (size == 0) {
         mm_free(ptr);
         return NULL;
@@ -389,15 +396,11 @@ void *mm_realloc(void *ptr, size_t size)
     // 복사할 크기는 원래 블록의 사이즈
     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
 
-    // 요청된 크기보다 원래 크기가 크면 잘라서 복사
+    // 요청된 크기보다 원래 크기가 크면 잘라서 복사 (사용자가 요청한 만큼만 복사)
     if (size < copySize)
       copySize = size;
 
-    memcpy(newptr, oldptr, copySize);  // 데이터 복사
+    memcpy(newptr, oldptr, copySize);  // 데이터 복사 (payload만 복사됨)
     mm_free(oldptr);                   // 기존 블록 반환
     return newptr;
-
-    // Case 1: 요청한 size가 기존 블록보다 작거나 거의 비슷 → 그대로 사용
-    // Case 2: 뒤 블록이 free이고, 병합해서 충분한 크기면 → in-place 확장
-    // Case 3: in-place 확장 불가능 → 새로 malloc, 복사, free
 }
