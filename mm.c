@@ -93,12 +93,13 @@ static void insert_node(void *bp) {
     void *curr;  // 리스트를 탐색하며 현재 비교 중인 노드
     void *prev = NULL;  // curr 직전 노드 (삽입 위치)
 
-    size_t size = GET_SIZE(HDRP(bp));  // 삽입할 블록의 크기
+    size_t original_size = GET_SIZE(HDRP(bp));
+    size_t temp_size = original_size;
 
     // 블록 크기에 따라 적절한 리스트 인덱스를 선택
     // 마지막 리스트 전까지, 블록 크기가 줄어들 여지가 있을 때까지 size를 절반으로 줄이며 적절한 리스트 인덱스 탐색
     // size가 1 이하가 되면 그 이상 분류할 필요가 없음
-    while ((list_idx < LISTLIMIT - 1) && (size > 1)) {
+    while ((list_idx < LISTLIMIT - 1) && (temp_size > 1)) {
         // 2로 나누면서 크기 구간 좁혀가기
         // 크기를 절반으로 줄여가면서, 얼마나 큰 크기인지를 판단 -> 작은 블록은 낮은 인덱스의 리스트로, 큰 블록은 높은 인덱스로 보냄
 
@@ -111,14 +112,14 @@ static void insert_node(void *bp) {
         // ...
 
         // → 크기에 따라 list_idx가 점점 증가
-        size >>= 1;
+        temp_size >>= 1;
         list_idx++;
     }
     
     curr = segregation_list[list_idx];
     
     // curr이 NULL이 아니고, 현재 curr의 크기가 bp보다 작으면 계속 이동
-    while ((curr != NULL) && (size >= GET_SIZE(HDRP(curr)))) {
+    while ((curr != NULL) && (original_size >= GET_SIZE(HDRP(curr)))) {
         prev = curr;        // 이전 노드 기억
         curr = SUCC(curr);  // 다음 노드로 이동
     }
